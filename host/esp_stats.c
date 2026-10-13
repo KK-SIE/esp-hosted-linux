@@ -9,6 +9,68 @@
 #include "utils.h"
 #include "esp_stats.h"
 #include "esp_kernel_port.h"
+#include <linux/module.h>
+#include <linux/seq_file.h>
+
+bool esp_diag_enabled;
+module_param_named(diag_enabled, esp_diag_enabled, bool, 0644);
+MODULE_PARM_DESC(diag_enabled, "Enable packet and transport diagnostic counters");
+
+static atomic64_t esp_diag_counters[ESP_DIAG_COUNT];
+static const char * const esp_diag_names[ESP_DIAG_COUNT] = {
+	"tx_input", "tx_input_bytes",
+	"tx_len_le128", "tx_len_129_512", "tx_len_gt512",
+	"tx_nonlinear", "tx_gso", "tx_checksum_partial",
+	"tx_enqueue", "tx_dequeue", "tx_drop",
+	"credit_start", "credit_done", "credit_error", "credit_empty",
+	"tx_bus_start", "tx_bus_done", "tx_bus_error",
+	"tx_wire_bytes", "tx_unsafe_padding",
+	"irq_callback", "irq_read_start", "irq_read_done",
+	"irq_error", "irq_rx_notify", "irq_clear_start", "irq_clear_done",
+	"rx_start", "rx_done", "rx_error", "rx_packet", "rx_bytes",
+	"cmd_wait", "cmd_response", "cmd_timeout"
+};
+
+void esp_diag_add(enum esp_diag_counter counter, u64 value)
+{
+	if (esp_diag_enabled)
+		atomic64_add(value, &esp_diag_counters[counter]);
+}
+
+void esp_diag_tx_skb(struct sk_buff *skb)
+{
+	struct ethhdr ethernet;
+	u16 protocol = 0;
+
+	if (!esp_diag_enabled)
+		return;
+	if (skb->len >= sizeof(ethernet) &&
+	    !skb_copy_bits(skb, 0, &ethernet, sizeof(ethernet)))
+		protocol = ntohs(ethernet.h_proto);
+	esp_diag_add(ESP_DIAG_TX_INPUT, 1);
+	esp_diag_add(ESP_DIAG_TX_BYTES, skb->len);
+	esp_diag_add(skb->len <= 128 ? ESP_DIAG_TX_SMALL :
+		     skb->len <= 512 ? ESP_DIAG_TX_MEDIUM : ESP_DIAG_TX_LARGE, 1);
+	esp_diag_add(ESP_DIAG_TX_NONLINEAR, skb_is_nonlinear(skb));
+	esp_diag_add(ESP_DIAG_TX_GSO, skb_is_gso(skb));
+	esp_diag_add(ESP_DIAG_TX_PARTIAL, skb->ip_summed == CHECKSUM_PARTIAL);
+	pr_info_ratelimited("esp32_diag: TX_INPUT len=%u headlen=%u data_len=%u headroom=%u tailroom=%d nonlinear=%u gso=%u gso_size=%u gso_type=0x%x checksum=%u ethertype=0x%04x\n",
+		skb->len, skb_headlen(skb), skb->data_len, skb_headroom(skb),
+		skb_tailroom(skb), skb_is_nonlinear(skb), skb_is_gso(skb),
+		skb_shinfo(skb)->gso_size, skb_shinfo(skb)->gso_type,
+		skb->ip_summed, protocol);
+}
+
+int esp_diag_show(struct seq_file *output, void *unused)
+{
+	unsigned int counter;
+
+	seq_printf(output, "enabled %u\njiffies %lu\n", esp_diag_enabled, jiffies);
+	for (counter = 0; counter < ESP_DIAG_COUNT; counter++)
+		seq_printf(output, "%s %lld\n", esp_diag_names[counter],
+			(long long)atomic64_read(&esp_diag_counters[counter]));
+	return 0;
+}
 
 #if TEST_RAW_TP
 

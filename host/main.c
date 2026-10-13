@@ -106,6 +106,7 @@ static int process_tx_packet(struct sk_buff *skb)
 	}
 
 	len = skb->len;
+	esp_diag_tx_skb(skb);
 
 	/* Create space for payload header */
 	pad_len = sizeof(struct esp_payload_header);

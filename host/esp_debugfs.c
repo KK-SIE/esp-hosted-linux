@@ -3,6 +3,8 @@
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
+#include <linux/seq_file.h>
+#include "esp_stats.h"
 
 #define DEBUGFS_DIR_NAME "esp32"
 #define LOG_LEVEL "log_level"
@@ -23,6 +25,7 @@ struct esp32_debugfs {
 	struct dentry *debugfs_dir;
 	struct dentry *log_level_file; /* log level for host dmesg */
 	struct dentry *version;
+	struct dentry *diag_stats;
 #if DEBUGFS_TODO
 	struct dentry *host_log_level_file; /* log level for host logs in debugfs logger */
 	struct dentry *host_log_file; /* debugfs host logger */
@@ -200,6 +203,19 @@ static const struct file_operations version_ops = {
 	.read = version_read,
 };
 
+static int diag_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, esp_diag_show, NULL);
+}
+
+static const struct file_operations diag_stats_ops = {
+	.owner = THIS_MODULE,
+	.open = diag_stats_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 // Module initialization function
 int debugfs_init(void)
 {
@@ -225,6 +241,8 @@ int debugfs_init(void)
 		esp_err("Failed to create debugfs %s file\n", VERSION);
 		goto cleanup;
 	}
+	debugfs->diag_stats = debugfs_create_file("diag_stats", 0444,
+			debugfs->debugfs_dir, NULL, &diag_stats_ops);
 
 #if DEBUGFS_TODO
 	debugfs->host_log_level_file = debugfs_create_file(DEBUGFS_LOG_LEVEL, 0644, debugfs_dir, NULL, &debugfs_log_level_ops);
@@ -281,6 +299,9 @@ void debugfs_exit(void)
 		debugfs->version = NULL;
 	}
 	if (debugfs->debugfs_dir) {
+		if (!IS_ERR_OR_NULL(debugfs->diag_stats))
+			debugfs_remove(debugfs->diag_stats);
+		debugfs->diag_stats = NULL;
 		debugfs_remove(debugfs->debugfs_dir);
 		debugfs->debugfs_dir = NULL;
 	}

@@ -73,6 +73,7 @@ static void esp_handle_isr(struct sdio_func *func)
 	if (!func) {
 		return;
 	}
+	esp_diag_add(ESP_DIAG_IRQ, 1);
 
 	if (host_sleep)
 		return;
@@ -92,15 +93,24 @@ static void esp_handle_isr(struct sdio_func *func)
 	}
 
 	/* Read interrupt status register */
+	esp_diag_add(ESP_DIAG_IRQ_READ_START, 1);
 	ret = esp_read_reg(context, ESP_SLAVE_INT_ST_REG,
 			(u8 *) int_status, sizeof(*int_status), ACQUIRE_LOCK);
+	esp_diag_add(ESP_DIAG_IRQ_READ_DONE, 1);
+	esp_diag_add(ESP_DIAG_IRQ_ERROR, ret != 0);
+	if (!ret)
+		esp_diag_add(ESP_DIAG_IRQ_NOTIFY,
+			     !!(*int_status & ESP_SLAVE_RX_NEW_PACKET_INT));
 	CHECK_SDIO_RW_ERROR(ret);
 
 	esp_process_interrupt(context, *int_status);
 
 	/* Clear interrupt status */
+	esp_diag_add(ESP_DIAG_IRQ_CLEAR_START, 1);
 	ret = esp_write_reg(context, ESP_SLAVE_INT_CLR_REG,
 			(u8 *) int_status, sizeof(*int_status), ACQUIRE_LOCK);
+	esp_diag_add(ESP_DIAG_IRQ_CLEAR_DONE, 1);
+	esp_diag_add(ESP_DIAG_IRQ_ERROR, ret != 0);
 	CHECK_SDIO_RW_ERROR(ret);
 
 	kfree(int_status);
@@ -388,6 +398,7 @@ static struct sk_buff *read_packet(struct esp_adapter *adapter)
 
 	/* Read length */
 	ret = esp_get_len_from_slave(context, &len_from_slave, LOCK_ALREADY_ACQUIRED);
+	esp_diag_add(ESP_DIAG_RX_ERROR, ret != 0);
 
 	if (ret || !len_from_slave) {
 		sdio_release_host(context->func);
@@ -424,17 +435,21 @@ static struct sk_buff *read_packet(struct esp_adapter *adapter)
 
 		if (num_blocks) {
 			len_to_read = num_blocks * ESP_BLOCK_SIZE;
+			esp_diag_add(ESP_DIAG_RX_START, 1);
 			ret = esp_read_block(context,
 					ESP_SLAVE_CMD53_END_ADDR - len_to_read,
 					pos, len_to_read, LOCK_ALREADY_ACQUIRED);
 		} else {
 			len_to_read = data_left;
 			/* 4 byte aligned length */
+			esp_diag_add(ESP_DIAG_RX_START, 1);
 			ret = esp_read_block(context,
 					ESP_SLAVE_CMD53_END_ADDR - len_to_read,
 					pos, (len_to_read + 3) & (~3), LOCK_ALREADY_ACQUIRED);
 		}
 
+		esp_diag_add(ESP_DIAG_RX_DONE, 1);
+		esp_diag_add(ESP_DIAG_RX_ERROR, ret != 0);
 		if (ret) {
 			esp_err("Failed to read data - %d [%u - %d]\n", ret, num_blocks, len_to_read);
 			atomic_set(&context->adapter->state, ESP_CONTEXT_DISABLED);
@@ -453,6 +468,8 @@ static struct sk_buff *read_packet(struct esp_adapter *adapter)
 
 	sdio_release_host(context->func);
 
+	esp_diag_add(ESP_DIAG_RX_PACKET, 1);
+	esp_diag_add(ESP_DIAG_RX_BYTES, len_from_slave);
 	return skb;
 }
 
@@ -474,6 +491,7 @@ static int write_packet(struct esp_adapter *adapter, struct sk_buff *skb)
 	}
 
 	if (skb->len > max_pkt_size) {
+		esp_diag_add(ESP_DIAG_TX_DROP, 1);
 		esp_err("Drop pkt of len[%u] > max SDIO transport len[%u]\n",
 				skb->len, max_pkt_size);
 		dev_kfree_skb(skb);
@@ -483,6 +501,7 @@ static int write_packet(struct esp_adapter *adapter, struct sk_buff *skb)
 
 	cb = (struct esp_skb_cb *)skb->cb;
 	if (cb && cb->priv && (atomic_read(&tx_pending) >= TX_MAX_PENDING_COUNT)) {
+		esp_diag_add(ESP_DIAG_TX_DROP, 1);
 		esp_tx_pause(cb->priv);
 		dev_kfree_skb(skb);
 		skb = NULL;
@@ -503,6 +522,14 @@ static int write_packet(struct esp_adapter *adapter, struct sk_buff *skb)
 
 	atomic_inc(&queue_items[prio]);
 	skb_queue_tail(&(sdio_context.tx_q[prio]), skb);
+	esp_diag_add(ESP_DIAG_TX_ENQUEUE, 1);
+	if (esp_diag_enabled)
+		pr_info_ratelimited("esp32_diag: QUEUES pending=%d high=%u mid=%u low=%u state=%d sleep=%u\n",
+			atomic_read(&tx_pending),
+			skb_queue_len(&sdio_context.tx_q[PRIO_Q_HIGH]),
+			skb_queue_len(&sdio_context.tx_q[PRIO_Q_MID]),
+			skb_queue_len(&sdio_context.tx_q[PRIO_Q_LOW]),
+			atomic_read(&adapter->state), host_sleep);
 
 	return 0;
 }
@@ -521,7 +548,10 @@ static int is_sdio_write_buffer_available(u32 buf_needed)
 	  then only read for available buffer number from slave*/
 	if (buf_available < buf_needed) {
 		while (retry) {
+			esp_diag_add(ESP_DIAG_CREDIT_START, 1);
 			ret = esp_slave_get_tx_buffer_num(context, &buf_available, ACQUIRE_LOCK);
+			esp_diag_add(ESP_DIAG_CREDIT_DONE, 1);
+			esp_diag_add(ESP_DIAG_CREDIT_ERROR, ret != 0);
 
 			if (buf_available < buf_needed) {
 
@@ -539,6 +569,7 @@ static int is_sdio_write_buffer_available(u32 buf_needed)
 		buf_available -= buf_needed;
 
 	if (!retry) {
+		esp_diag_add(ESP_DIAG_CREDIT_EMPTY, 1);
 		/* No buffer available at slave */
 		return BUFFER_UNAVAILABLE;
 	}
@@ -604,6 +635,7 @@ static int tx_process(void *data)
 
 		if (atomic_read(&tx_pending))
 			atomic_dec(&tx_pending);
+		esp_diag_add(ESP_DIAG_TX_DEQUEUE, 1);
 
 		retry = MAX_WRITE_RETRIES;
 
@@ -624,6 +656,7 @@ static int tx_process(void *data)
 		else wait till buffer is available*/
 		ret = is_sdio_write_buffer_available(buf_needed);
 		if (!ret) {
+			esp_diag_add(ESP_DIAG_TX_DROP, 1);
 			dev_kfree_skb(tx_skb);
 			continue;
 		}
@@ -634,13 +667,25 @@ static int tx_process(void *data)
 		data_left = tx_skb->len;
 		pad = ESP_BLOCK_SIZE - (data_left % ESP_BLOCK_SIZE);
 		data_left += pad;
+		if (skb_is_nonlinear(tx_skb) || skb_tailroom(tx_skb) < pad) {
+			esp_diag_add(ESP_DIAG_TX_UNSAFE_PADDING, 1);
+			if (esp_diag_enabled)
+				pr_warn_ratelimited("esp32_diag: TX_LAYOUT len=%u headlen=%u pad=%u tailroom=%d nonlinear=%u\n",
+					tx_skb->len, skb_headlen(tx_skb), pad,
+					skb_tailroom(tx_skb), skb_is_nonlinear(tx_skb));
+		}
 
 
 		do {
 			block_cnt = data_left / ESP_BLOCK_SIZE;
 			len_to_send = data_left;
+			esp_diag_add(ESP_DIAG_TX_START, 1);
 			ret = esp_write_block(context, ESP_SLAVE_CMD53_END_ADDR - len_to_send,
 					pos, (len_to_send + 3) & (~3), ACQUIRE_LOCK);
+			esp_diag_add(ESP_DIAG_TX_DONE, 1);
+			esp_diag_add(ESP_DIAG_TX_ERROR, ret != 0);
+			if (!ret)
+				esp_diag_add(ESP_DIAG_TX_WIRE_BYTES, (len_to_send + 3) & (~3));
 
 			if (ret) {
 				esp_err("Failed to send data: %d %d %d\n", ret, len_to_send, data_left);
@@ -653,6 +698,7 @@ static int tx_process(void *data)
 
 		if (ret) {
 			/* drop the packet */
+			esp_diag_add(ESP_DIAG_TX_DROP, 1);
 			dev_kfree_skb(tx_skb);
 			continue;
 		}
