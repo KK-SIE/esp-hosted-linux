@@ -123,7 +123,11 @@ static int process_tx_packet(struct sk_buff *skb)
 
 	if (realloc_skb || !IS_ALIGNED((unsigned long) skb->data, SKB_DATA_ADDR_ALIGNMENT)) {
 		/* Realloc SKB */
-		if (skb_linearize(skb)) {
+		ret = skb_linearize(skb);
+		if (ret) {
+			esp_diag_add(ESP_DIAG_TX_DRIVER_ERROR, 1);
+			esp_diag_event(ESP_DIAG_EV_TX_DRIVER_ERROR, len,
+				       skb_headlen(skb), ret, 1);
 			priv->stats.tx_errors++;
 			dev_kfree_skb(skb);
 			esp_err("Failed to linearize SKB");
@@ -133,6 +137,9 @@ static int process_tx_packet(struct sk_buff *skb)
 		new_skb = esp_alloc_skb(skb->len + pad_len);
 
 		if (!new_skb) {
+			esp_diag_add(ESP_DIAG_TX_DRIVER_ERROR, 1);
+			esp_diag_event(ESP_DIAG_EV_TX_DRIVER_ERROR, len,
+				       pad_len, -ENOMEM, 2);
 			esp_err("Failed to allocate SKB");
 			priv->stats.tx_errors++;
 			dev_kfree_skb(skb);
@@ -171,6 +178,9 @@ static int process_tx_packet(struct sk_buff *skb)
 		ret = esp_send_packet(priv->adapter, skb);
 
 		if (ret) {
+			esp_diag_add(ESP_DIAG_TX_DRIVER_ERROR, 1);
+			esp_diag_event(ESP_DIAG_EV_TX_DRIVER_ERROR, len,
+				       0, ret, 3);
 			esp_verbose("Failed to send SKB");
 			priv->stats.tx_errors++;
 		} else {
@@ -178,6 +188,8 @@ static int process_tx_packet(struct sk_buff *skb)
 			priv->stats.tx_bytes += skb->len;
 		}
 	} else {
+		esp_diag_add(ESP_DIAG_TX_DROP, 1);
+		esp_diag_event(ESP_DIAG_EV_TX_DROP, len, 0, -ESHUTDOWN, 0);
 		dev_kfree_skb_any(skb);
 		priv->stats.tx_dropped++;
 	}
@@ -447,6 +459,8 @@ static int esp_hard_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 	if (!priv->port_open) {
 		priv->stats.tx_dropped++;
+		esp_diag_add(ESP_DIAG_TX_DROP, 1);
+		esp_diag_event(ESP_DIAG_EV_TX_DROP, skb->len, 0, -ENETDOWN, 0);
 		esp_verbose("Port not yet open\n");
 		dev_kfree_skb(skb);
 		return NETDEV_TX_OK;
@@ -454,6 +468,9 @@ static int esp_hard_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 	if (!skb->len || (skb->len > ETH_FRAME_LEN)) {
 		esp_err("Bad len %d\n", skb->len);
+		esp_diag_add(ESP_DIAG_TX_DROP, 1);
+		esp_diag_event(ESP_DIAG_EV_TX_DROP, skb->len, ETH_FRAME_LEN,
+			       -EMSGSIZE, 0);
 		priv->stats.tx_dropped++;
 		dev_kfree_skb(skb);
 		return NETDEV_TX_OK;
@@ -1029,8 +1046,8 @@ static struct esp_adapter *init_adapter(void)
 {
 	memset(&adapter, 0, sizeof(adapter));
 
-	/* Prepare interface RX work */
-	adapter.if_rx_workqueue = alloc_workqueue("ESP_IF_RX_WORK_QUEUE", 0, 0);
+	/* Prioritize SDIO RX work to reduce command and event latency under load. */
+	adapter.if_rx_workqueue = alloc_workqueue("ESP_IF_RX_WORK_QUEUE", WQ_HIGHPRI, 0);
 
 	if (!adapter.if_rx_workqueue) {
 		deinit_adapter();

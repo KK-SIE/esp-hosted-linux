@@ -11,23 +11,53 @@
 #include "esp_kernel_port.h"
 #include <linux/module.h>
 #include <linux/seq_file.h>
+#include <linux/ktime.h>
+#include <linux/spinlock.h>
+#include <linux/vmalloc.h>
+
+#define ESP_DIAG_EVENT_CAPACITY 2048
+
+struct esp_diag_event_record {
+	u64 sequence;
+	u64 time_ns;
+	u32 type;
+	s32 a;
+	s32 b;
+	s32 c;
+	s32 d;
+};
 
 bool esp_diag_enabled;
 module_param_named(diag_enabled, esp_diag_enabled, bool, 0644);
 MODULE_PARM_DESC(diag_enabled, "Enable packet and transport diagnostic counters");
 
 static atomic64_t esp_diag_counters[ESP_DIAG_COUNT];
+static DEFINE_SPINLOCK(esp_diag_event_lock);
+static struct esp_diag_event_record esp_diag_events[ESP_DIAG_EVENT_CAPACITY];
+static u64 esp_diag_event_sequence;
+static u32 esp_diag_event_head;
+static u32 esp_diag_event_count;
+
+static const char * const esp_diag_event_names[] = {
+	"tx_input", "tx_enqueue", "tx_dequeue", "tx_credit",
+	"tx_bus_start", "tx_bus_done", "tx_drop", "tx_driver_error",
+	"tx_layout", "irq",
+	"rx_length", "rx_cmd53_start", "rx_cmd53_done", "rx_read_request",
+	"cmd_wait", "cmd_response", "cmd_timeout"
+};
 static const char * const esp_diag_names[ESP_DIAG_COUNT] = {
 	"tx_input", "tx_input_bytes",
 	"tx_len_le128", "tx_len_129_512", "tx_len_gt512",
 	"tx_nonlinear", "tx_gso", "tx_checksum_partial",
-	"tx_enqueue", "tx_dequeue", "tx_drop",
+	"tx_enqueue", "tx_dequeue", "tx_drop", "tx_driver_error",
 	"credit_start", "credit_done", "credit_error", "credit_empty",
 	"tx_bus_start", "tx_bus_done", "tx_bus_error",
 	"tx_wire_bytes", "tx_unsafe_padding",
 	"irq_callback", "irq_read_start", "irq_read_done",
 	"irq_error", "irq_rx_notify", "irq_clear_start", "irq_clear_done",
-	"rx_start", "rx_done", "rx_error", "rx_packet", "rx_bytes",
+	"rx_start", "rx_done", "rx_error",
+	"rx_length_error", "rx_data_error", "rx_delta_gt_buffer", "rx_truncated",
+	"rx_packet", "rx_bytes",
 	"cmd_wait", "cmd_response", "cmd_timeout"
 };
 
@@ -35,6 +65,29 @@ void esp_diag_add(enum esp_diag_counter counter, u64 value)
 {
 	if (esp_diag_enabled)
 		atomic64_add(value, &esp_diag_counters[counter]);
+}
+
+void esp_diag_event(enum esp_diag_event_type type, s32 a, s32 b, s32 c, s32 d)
+{
+	struct esp_diag_event_record *event;
+	unsigned long flags;
+
+	if (!esp_diag_enabled || (unsigned int)type >= ARRAY_SIZE(esp_diag_event_names))
+		return;
+
+	spin_lock_irqsave(&esp_diag_event_lock, flags);
+	event = &esp_diag_events[esp_diag_event_head];
+	event->sequence = ++esp_diag_event_sequence;
+	event->time_ns = ktime_get_ns();
+	event->type = type;
+	event->a = a;
+	event->b = b;
+	event->c = c;
+	event->d = d;
+	esp_diag_event_head = (esp_diag_event_head + 1) % ESP_DIAG_EVENT_CAPACITY;
+	if (esp_diag_event_count < ESP_DIAG_EVENT_CAPACITY)
+		esp_diag_event_count++;
+	spin_unlock_irqrestore(&esp_diag_event_lock, flags);
 }
 
 void esp_diag_tx_skb(struct sk_buff *skb)
@@ -54,6 +107,8 @@ void esp_diag_tx_skb(struct sk_buff *skb)
 	esp_diag_add(ESP_DIAG_TX_NONLINEAR, skb_is_nonlinear(skb));
 	esp_diag_add(ESP_DIAG_TX_GSO, skb_is_gso(skb));
 	esp_diag_add(ESP_DIAG_TX_PARTIAL, skb->ip_summed == CHECKSUM_PARTIAL);
+	esp_diag_event(ESP_DIAG_EV_TX_INPUT, skb->len, skb_headlen(skb),
+		       skb->data_len, protocol);
 	pr_info_ratelimited("esp32_diag: TX_INPUT len=%u headlen=%u data_len=%u headroom=%u tailroom=%d nonlinear=%u gso=%u gso_size=%u gso_type=0x%x checksum=%u ethertype=0x%04x\n",
 		skb->len, skb_headlen(skb), skb->data_len, skb_headroom(skb),
 		skb_tailroom(skb), skb_is_nonlinear(skb), skb_is_gso(skb),
@@ -69,6 +124,39 @@ int esp_diag_show(struct seq_file *output, void *unused)
 	for (counter = 0; counter < ESP_DIAG_COUNT; counter++)
 		seq_printf(output, "%s %lld\n", esp_diag_names[counter],
 			(long long)atomic64_read(&esp_diag_counters[counter]));
+	return 0;
+}
+
+int esp_diag_events_show(struct seq_file *output, void *unused)
+{
+	struct esp_diag_event_record *snapshot;
+	unsigned long flags;
+	u32 count, first, index;
+
+	snapshot = vmalloc(sizeof(*snapshot) * ESP_DIAG_EVENT_CAPACITY);
+	if (!snapshot)
+		return -ENOMEM;
+
+	spin_lock_irqsave(&esp_diag_event_lock, flags);
+	count = esp_diag_event_count;
+	first = (esp_diag_event_head + ESP_DIAG_EVENT_CAPACITY - count) %
+		ESP_DIAG_EVENT_CAPACITY;
+	for (index = 0; index < count; index++)
+		snapshot[index] = esp_diag_events[(first + index) %
+							 ESP_DIAG_EVENT_CAPACITY];
+	spin_unlock_irqrestore(&esp_diag_event_lock, flags);
+
+	seq_puts(output, "time_ns,sequence,event,a,b,c,d\n");
+	for (index = 0; index < count; index++) {
+		struct esp_diag_event_record *event = &snapshot[index];
+
+		seq_printf(output, "%llu,%llu,%s,%d,%d,%d,%d\n",
+			   (unsigned long long)event->time_ns,
+			   (unsigned long long)event->sequence,
+			   esp_diag_event_names[event->type], event->a, event->b,
+			   event->c, event->d);
+	}
+	vfree(snapshot);
 	return 0;
 }
 

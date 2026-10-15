@@ -26,6 +26,7 @@ struct esp32_debugfs {
 	struct dentry *log_level_file; /* log level for host dmesg */
 	struct dentry *version;
 	struct dentry *diag_stats;
+	struct dentry *diag_events;
 #if DEBUGFS_TODO
 	struct dentry *host_log_level_file; /* log level for host logs in debugfs logger */
 	struct dentry *host_log_file; /* debugfs host logger */
@@ -216,6 +217,19 @@ static const struct file_operations diag_stats_ops = {
 	.release = single_release,
 };
 
+static int diag_events_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, esp_diag_events_show, NULL);
+}
+
+static const struct file_operations diag_events_ops = {
+	.owner = THIS_MODULE,
+	.open = diag_events_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 // Module initialization function
 int debugfs_init(void)
 {
@@ -243,6 +257,18 @@ int debugfs_init(void)
 	}
 	debugfs->diag_stats = debugfs_create_file("diag_stats", 0444,
 			debugfs->debugfs_dir, NULL, &diag_stats_ops);
+	if (IS_ERR_OR_NULL(debugfs->diag_stats)) {
+		debugfs->diag_stats = NULL;
+		esp_err("Failed to create debugfs diag_stats file\n");
+		goto cleanup;
+	}
+	debugfs->diag_events = debugfs_create_file("diag_events.csv", 0444,
+			debugfs->debugfs_dir, NULL, &diag_events_ops);
+	if (IS_ERR_OR_NULL(debugfs->diag_events)) {
+		debugfs->diag_events = NULL;
+		esp_err("Failed to create debugfs diag_events.csv file\n");
+		goto cleanup;
+	}
 
 #if DEBUGFS_TODO
 	debugfs->host_log_level_file = debugfs_create_file(DEBUGFS_LOG_LEVEL, 0644, debugfs_dir, NULL, &debugfs_log_level_ops);
@@ -302,6 +328,9 @@ void debugfs_exit(void)
 		if (!IS_ERR_OR_NULL(debugfs->diag_stats))
 			debugfs_remove(debugfs->diag_stats);
 		debugfs->diag_stats = NULL;
+		if (!IS_ERR_OR_NULL(debugfs->diag_events))
+			debugfs_remove(debugfs->diag_events);
+		debugfs->diag_events = NULL;
 		debugfs_remove(debugfs->debugfs_dir);
 		debugfs->debugfs_dir = NULL;
 	}

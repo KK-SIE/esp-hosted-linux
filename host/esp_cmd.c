@@ -261,6 +261,8 @@ static int wait_and_decode_cmd_resp(struct esp_wifi_device *priv,
 
 	/* wait for command response */
 	esp_diag_add(ESP_DIAG_CMD_WAIT, 1);
+	esp_diag_event(ESP_DIAG_EV_CMD_WAIT, cmd_node->cmd_code,
+		       COMMAND_RESPONSE_TIMEOUT / HZ, 0, 0);
 	if (esp_diag_enabled)
 		pr_info_ratelimited("esp32_diag: CMD_WAIT code=0x%02x\n", cmd_node->cmd_code);
 	ret = wait_event_interruptible_timeout(adapter->wait_for_cmd_resp,
@@ -271,6 +273,8 @@ static int wait_and_decode_cmd_resp(struct esp_wifi_device *priv,
 
 	if (ret == 0) {
 		esp_diag_add(ESP_DIAG_CMD_TIMEOUT, 1);
+		esp_diag_event(ESP_DIAG_EV_CMD_TIMEOUT, cmd_node->cmd_code,
+			       COMMAND_RESPONSE_TIMEOUT / HZ, 0, 0);
 		esp_err("Command[0x%X] timed out\n", cmd_node->cmd_code);
 		ret = -EINVAL;
 	} else {
@@ -599,6 +603,8 @@ int process_cmd_resp(struct esp_adapter *adapter, struct sk_buff *skb)
 	if (esp_diag_enabled && skb->len >= sizeof(struct command_header)) {
 		struct command_header *header = (struct command_header *)skb->data;
 
+		esp_diag_event(ESP_DIAG_EV_CMD_RESPONSE, header->cmd_code,
+			       header->cmd_status, skb->len, 0);
 		pr_info_ratelimited("esp32_diag: CMD_RESP expected=0x%02x received=0x%02x status=%u len=%u\n",
 			adapter->cur_cmd->cmd_code, header->cmd_code,
 			header->cmd_status, skb->len);
